@@ -6,12 +6,11 @@ use crate::runtime::blocking::schedule::NoopSchedule;
 use crate::runtime::blocking::shutdown;
 use crate::runtime::builder::ThreadNameFn;
 use crate::runtime::context;
-use crate::runtime::task::{self, JoinHandle};
+use crate::runtime::task::{self, JoinHandle, SpawnBlockingError};
 use crate::runtime::{Builder, Callback, ToHandle};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io;
 use std::time::Duration;
 
 pub(crate) struct BlockingPool {
@@ -81,25 +80,6 @@ pub(crate) enum Mandatory {
     #[cfg_attr(not(fs), allow(dead_code))]
     Mandatory,
     NonMandatory,
-}
-
-pub(crate) enum SpawnError {
-    /// Pool is shutting down and the task was not scheduled
-    ShuttingDown,
-    /// There are no worker threads available to take the task
-    /// and the OS failed to spawn a new one
-    NoThreads(io::Error),
-}
-
-impl From<SpawnError> for io::Error {
-    fn from(e: SpawnError) -> Self {
-        match e {
-            SpawnError::ShuttingDown => {
-                io::Error::new(io::ErrorKind::Other, "blocking pool shutting down")
-            }
-            SpawnError::NoThreads(e) => e,
-        }
-    }
 }
 
 impl Task {
@@ -241,7 +221,7 @@ impl fmt::Debug for BlockingPool {
 // ===== impl Spawner =====
 
 impl Spawner {
-    pub(crate) fn spawn(&self, task: Task, rt: &dyn ToHandle) -> Result<(), SpawnError> {
+    pub(crate) fn spawn(&self, task: Task, rt: &dyn ToHandle) -> Result<(), SpawnBlockingError> {
         let mut shared = self.inner.shared.lock();
 
         if shared.shutdown {
@@ -251,7 +231,7 @@ impl Spawner {
             task.task.shutdown();
 
             // no need to even push this task; it would never get picked up
-            return Err(SpawnError::ShuttingDown);
+            return Err(SpawnBlockingError::shutdown());
         }
 
         shared.queue.push_back(task);
@@ -282,7 +262,7 @@ impl Spawner {
                         Err(e) => {
                             // The OS refused to spawn the thread and there is no thread
                             // to pick up the task that has just been pushed to the queue.
-                            return Err(SpawnError::NoThreads(e));
+                            return Err(SpawnBlockingError::no_blocking_threads(e));
                         }
                     }
                 }

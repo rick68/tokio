@@ -1,5 +1,7 @@
 use crate::runtime::blocking::{BlockingTask, NoopSchedule};
-use crate::runtime::task::{self, JoinHandle};
+use crate::runtime::task::{
+    self, JoinHandle, SpawnBlockingError, SpawnBlockingErrorKind, SpawnError, SpawnFailure,
+};
 use crate::runtime::{blocking, context, driver, Spawner};
 use crate::util::error::{CONTEXT_MISSING_ERROR, THREAD_LOCAL_DESTROYED_ERROR};
 
@@ -180,7 +182,8 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.spawn_named(future, None)
+        // Compat: ignore errors
+        self.spawn_named(future, None).unwrap_or_else(|e| e.handle)
     }
 
     /// Runs the provided function on an executor dedicated to blocking.
@@ -304,7 +307,11 @@ impl Handle {
     }
 
     #[track_caller]
-    pub(crate) fn spawn_named<F>(&self, future: F, _name: Option<&str>) -> JoinHandle<F::Output>
+    pub(crate) fn spawn_named<F>(
+        &self,
+        future: F,
+        _name: Option<&str>,
+    ) -> Result<JoinHandle<F::Output>, SpawnFailure<F::Output, SpawnError>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -345,21 +352,21 @@ impl HandleInner {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (join_handle, spawn_result) = if cfg!(debug_assertions)
-            && std::mem::size_of::<F>() > 2048
-        {
+        let spawn_result = if cfg!(debug_assertions) && std::mem::size_of::<F>() > 2048 {
             self.spawn_blocking_inner(Box::new(func), blocking::Mandatory::NonMandatory, None, rt)
         } else {
             self.spawn_blocking_inner(func, blocking::Mandatory::NonMandatory, None, rt)
         };
 
         match spawn_result {
-            Ok(()) => join_handle,
-            // Compat: do not panic here, return the join_handle even though it will never resolve
-            Err(blocking::SpawnError::ShuttingDown) => join_handle,
-            Err(blocking::SpawnError::NoThreads(e)) => {
-                panic!("OS can't spawn worker thread: {}", e)
-            }
+            Ok(join_handle) => join_handle,
+            Err(e) => match e.inner.kind {
+                // Compat: do not panic here, return the join_handle even though it will never resolve
+                SpawnBlockingErrorKind::Shutdown => e.handle,
+                SpawnBlockingErrorKind::NoBlockingThreads(e) => {
+                    panic!("OS can't spawn worker thread: {}", e)
+                }
+            },
         }
     }
 
@@ -374,7 +381,7 @@ impl HandleInner {
             F: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            let (join_handle, spawn_result) = if cfg!(debug_assertions) && std::mem::size_of::<F>() > 2048 {
+            let spawn_result = if cfg!(debug_assertions) && std::mem::size_of::<F>() > 2048 {
                 self.spawn_blocking_inner(
                     Box::new(func),
                     blocking::Mandatory::Mandatory,
@@ -390,11 +397,7 @@ impl HandleInner {
                 )
             };
 
-            if spawn_result.is_ok() {
-                Some(join_handle)
-            } else {
-                None
-            }
+            spawn_result.ok()
         }
     }
 
@@ -405,7 +408,7 @@ impl HandleInner {
         is_mandatory: blocking::Mandatory,
         name: Option<&str>,
         rt: &dyn ToHandle,
-    ) -> (JoinHandle<R>, Result<(), blocking::SpawnError>)
+    ) -> Result<JoinHandle<R>, SpawnFailure<R, SpawnBlockingError>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -432,10 +435,13 @@ impl HandleInner {
         let _ = name;
 
         let (task, handle) = task::unowned(fut, NoopSchedule, id);
-        let spawned = self
+        match self
             .blocking_spawner
-            .spawn(blocking::Task::new(task, is_mandatory), rt);
-        (handle, spawned)
+            .spawn(blocking::Task::new(task, is_mandatory), rt)
+        {
+            Ok(()) => Ok(handle),
+            Err(e) => Err(SpawnFailure::new(handle, e)),
+        }
     }
 }
 

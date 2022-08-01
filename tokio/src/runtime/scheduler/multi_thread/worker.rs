@@ -70,6 +70,7 @@ use crate::util::atomic_cell::AtomicCell;
 use crate::util::FastRand;
 
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::time::Duration;
 
 /// A scheduler worker
@@ -695,12 +696,15 @@ impl Worker {
 }
 
 impl task::Schedule for Arc<Shared> {
+    type Error = Infallible;
+
     fn release(&self, task: &Task) -> Option<Task> {
         self.owned.remove(task)
     }
 
-    fn schedule(&self, task: Notified) {
+    fn schedule(&self, task: Notified) -> Result<(), Self::Error> {
         (**self).schedule(task, false);
+        Ok(())
     }
 
     fn yield_now(&self, task: Notified) {

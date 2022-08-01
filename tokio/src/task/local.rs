@@ -1,6 +1,8 @@
 //! Runs `!Send` futures on the current thread.
 use crate::loom::sync::{Arc, Mutex};
-use crate::runtime::task::{self, JoinHandle, LocalOwnedTasks, Task};
+use crate::runtime::task::{
+    self, JoinHandle, LocalOwnedTasks, SpawnFailure, SpawnLocalError, Task,
+};
 use crate::sync::AtomicWaker;
 use crate::util::VecDequeCell;
 
@@ -301,12 +303,13 @@ cfg_rt! {
         F: Future + 'static,
         F::Output: 'static,
     {
-        spawn_local_inner(future, None)
+        // Compat: ignore errors here
+        spawn_local_inner(future, None).unwrap_or_else(|e| e.handle)
     }
 
 
     #[track_caller]
-    pub(super) fn spawn_local_inner<F>(future: F, name: Option<&str>) -> JoinHandle<F::Output>
+    pub(super) fn spawn_local_inner<F>(future: F, name: Option<&str>) -> Result<JoinHandle<F::Output>, SpawnFailure<F::Output, SpawnLocalError>>
     where F: Future + 'static,
           F::Output: 'static
     {
@@ -316,7 +319,6 @@ cfg_rt! {
                 None => panic!("`spawn_local` called from outside of a `task::LocalSet`"),
                 Some(cx) => cx.spawn(future, name)
             }
-
         })
     }
 }
@@ -422,7 +424,8 @@ impl LocalSet {
         F: Future + 'static,
         F::Output: 'static,
     {
-        self.spawn_named(future, None)
+        // Compat: ignore errors here
+        self.spawn_named(future, None).unwrap_or_else(|e| e.handle)
     }
 
     /// Runs a future to completion on the provided runtime, driving any local
@@ -540,12 +543,12 @@ impl LocalSet {
         &self,
         future: F,
         name: Option<&str>,
-    ) -> JoinHandle<F::Output>
+    ) -> Result<JoinHandle<F::Output>, SpawnFailure<F::Output, SpawnLocalError>>
     where
         F: Future + 'static,
         F::Output: 'static,
     {
-        let handle = self.context.spawn(future, name);
+        let res = self.context.spawn(future, name);
 
         // Because a task was spawned from *outside* the `LocalSet`, wake the
         // `LocalSet` future to execute the new task, if it hasn't been woken.
@@ -554,7 +557,7 @@ impl LocalSet {
         // only be called from *within* a future executing on the `LocalSet` —
         // in that case, the `LocalSet` must already be awake.
         self.context.shared.waker.wake();
-        handle
+        res
     }
 
     /// Ticks the scheduler, returning whether the local future needs to be
@@ -771,7 +774,11 @@ impl Drop for LocalSet {
 
 impl Context {
     #[track_caller]
-    fn spawn<F>(&self, future: F, name: Option<&str>) -> JoinHandle<F::Output>
+    fn spawn<F>(
+        &self,
+        future: F,
+        name: Option<&str>,
+    ) -> Result<JoinHandle<F::Output>, SpawnFailure<F::Output, SpawnLocalError>>
     where
         F: Future + 'static,
         F::Output: 'static,
@@ -781,11 +788,13 @@ impl Context {
 
         let (handle, notified) = self.owned.bind(future, self.shared.clone(), id);
 
-        if let Some(notified) = notified {
-            self.shared.schedule(notified);
+        match notified {
+            Some(notified) => match self.shared.schedule(notified) {
+                Ok(()) => Ok(handle),
+                Err(e) => Err(SpawnFailure::new(handle, e)),
+            },
+            None => Err(SpawnFailure::new(handle, SpawnLocalError::shutdown())),
         }
-
-        handle
     }
 }
 
@@ -831,27 +840,27 @@ fn clone_rc<T>(rc: &Cell<Option<Rc<T>>>) -> Option<Rc<T>> {
 
 impl Shared {
     /// Schedule the provided task on the scheduler.
-    fn schedule(&self, task: task::Notified<Arc<Self>>) {
+    fn schedule(&self, task: task::Notified<Arc<Self>>) -> Result<(), SpawnLocalError> {
         CURRENT.with(|maybe_cx| {
             let ctx = clone_rc(maybe_cx);
             match ctx {
                 Some(cx) if cx.shared.ptr_eq(self) => {
                     cx.queue.push_back(task);
+                    Ok(())
                 }
                 _ => {
                     // First check whether the queue is still there (if not, the
-                    // LocalSet is dropped). Then push to it if so, and if not,
-                    // do nothing.
+                    // LocalSet is dropped). Then push to it if so
                     let mut lock = self.queue.lock();
 
-                    if let Some(queue) = lock.as_mut() {
-                        queue.push_back(task);
-                        drop(lock);
-                        self.waker.wake();
-                    }
+                    let queue = lock.as_mut().ok_or_else(SpawnLocalError::shutdown)?;
+                    queue.push_back(task);
+                    drop(lock);
+                    self.waker.wake();
+                    Ok(())
                 }
             }
-        });
+        })
     }
 
     fn ptr_eq(&self, other: &Shared) -> bool {
@@ -860,6 +869,8 @@ impl Shared {
 }
 
 impl task::Schedule for Arc<Shared> {
+    type Error = SpawnLocalError;
+
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
         CURRENT.with(|maybe_cx| {
             let ctx = clone_rc(maybe_cx);
@@ -873,8 +884,8 @@ impl task::Schedule for Arc<Shared> {
         })
     }
 
-    fn schedule(&self, task: task::Notified<Self>) {
-        Shared::schedule(self, task);
+    fn schedule(&self, task: task::Notified<Self>) -> Result<(), Self::Error> {
+        Shared::schedule(self, task)
     }
 
     cfg_unstable! {
