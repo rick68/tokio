@@ -361,7 +361,8 @@ impl HandleInner {
         match spawn_result {
             Ok(join_handle) => join_handle,
             Err(e) => match e.inner.kind {
-                // Compat: do not panic here, return the join_handle even though it will never resolve
+                // Compat: do not panic here, return the join_handle (which will resolve with a
+                // cancellation error)
                 SpawnBlockingErrorKind::Shutdown => e.handle,
                 SpawnBlockingErrorKind::NoBlockingThreads(e) => {
                     panic!("OS can't spawn worker thread: {}", e)

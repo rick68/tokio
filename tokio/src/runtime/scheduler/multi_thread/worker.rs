@@ -64,7 +64,7 @@ use crate::park::{Park, Unpark};
 use crate::runtime;
 use crate::runtime::enter::EnterContext;
 use crate::runtime::scheduler::multi_thread::{queue, Idle, Parker, Unparker};
-use crate::runtime::task::{Inject, JoinHandle, OwnedTasks};
+use crate::runtime::task::{Inject, JoinHandle, OwnedTasks, SpawnError, SpawnFailure};
 use crate::runtime::{task, Config, HandleInner, MetricsBatch, SchedulerMetrics, WorkerMetrics};
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::FastRand;
@@ -721,18 +721,20 @@ impl Shared {
         me: &Arc<Self>,
         future: T,
         id: crate::runtime::task::Id,
-    ) -> JoinHandle<T::Output>
+    ) -> Result<JoinHandle<T::Output>, SpawnFailure<T::Output, SpawnError>>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
         let (handle, notified) = me.owned.bind(future, me.clone(), id);
 
-        if let Some(notified) = notified {
-            me.schedule(notified, false);
+        match notified {
+            Some(notified) => {
+                me.schedule(notified, false);
+                Ok(handle)
+            }
+            None => Err(SpawnFailure::new(handle, SpawnError::shutdown())),
         }
-
-        handle
     }
 
     pub(super) fn schedule(&self, task: Notified, is_yield: bool) {

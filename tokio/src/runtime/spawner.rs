@@ -37,7 +37,7 @@ impl Spawner {
         match self {
             Spawner::CurrentThread(spawner) => spawner.spawn(future, id),
             #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
-            Spawner::MultiThread(spawner) => Ok(spawner.spawn(future, id)),
+            Spawner::MultiThread(spawner) => spawner.spawn(future, id),
         }
     }
 
