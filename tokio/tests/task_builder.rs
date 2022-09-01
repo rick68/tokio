@@ -107,7 +107,7 @@ mod tests {
         }
 
         {
-            let mut b = Builder::new();
+            let b = Builder::new();
             assert!(b.spawn_on(task(), &handle).unwrap_err().is_shutdown());
         }
         {
